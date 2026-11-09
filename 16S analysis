@@ -1,0 +1,1396 @@
+################################################################################
+# 16S rRNA Gene Sequencing Data Analysis
+#
+# Description:
+# This repository contains R scripts for the statistical analysis and
+# visualization of 16S rRNA gene sequencing data processed using mothur.
+#
+# Analyses include microbial community composition, diversity analyses,
+# statistical comparisons, and data visualization.
+################################################################################
+# 1. Load Required R Packages
+################################################################################
+
+# Data manipulation and organization
+library(dplyr)
+library(tidyverse)
+library(magrittr)
+
+# Data import
+library(readxl)
+library(file2meco)
+
+# Microbial community analysis
+library(phyloseq)
+library(microeco)
+library(vegan)
+library(metacoder)
+
+# Statistical analysis
+library(stats)
+library(rstatix)
+library(multcompView)
+
+################################################################################
+# 2. Load Required Datasets
+################################################################################
+OTU_PATH  <- "OTU.csv"
+TAX_PATH  <- "TAX.csv"
+META_PATH <- "Metadata.csv"
+
+otu_raw <- read.csv(OTU_PATH, row.names = 1, check.names = FALSE)
+tax_raw <- read.csv(TAX_PATH, check.names = FALSE)
+meta_raw <- read.csv(META_PATH, check.names = FALSE)
+
+# Clean metadata column names
+colnames(meta_raw) <- gsub("[\u00a0\\s]+", "", colnames(meta_raw), perl = TRUE)
+meta_raw$SampleID <- trimws(as.character(meta_raw$SampleName))
+meta_raw <- meta_raw %>%
+  mutate(Treatment  = trimws(as.character(Treatment)),
+         Treatment1 = trimws(as.character(Treatment1)),
+         Treatment2 = trimws(as.character(Treatment2)))
+
+# Map treatment codes to labels
+trt_label_map <- c(T1 = "Control+Water", T2 = "Control+SMT",
+                   T3 = "Strep+Water",   T4 = "Strep+SMT")
+meta_raw$Treatment_label <- trt_label_map[meta_raw$Treatment]
+
+cat("Samples:", nrow(meta_raw), "\n")
+cat("OTUs:", nrow(otu_raw), "\n")
+
+# ============================================================================
+# 3. RAREFY
+# ============================================================================
+samples  <- meta_raw$SampleID
+otu_t    <- t(as.matrix(otu_raw[, samples]))   # samples x OTUs
+
+set.seed(42)
+min_depth <- min(rowSums(otu_t))
+cat("Rarefying to", format(min_depth, big.mark = ","), "reads\n")
+otu_rare <- rrarefy(otu_t, sample = min_depth)
+
+# ============================================================================
+# 4. BUILD LINEAGE STRING FOR METACODER FIGURE
+# ============================================================================
+# Metacoder needs a semicolon-separated lineage column
+# Format: Kingdom;Phylum;Class;Order;Family;Genus
+
+# Clean unclassified labels — replace "X_unclassified" with NA equivalent
+clean_rank <- function(x) {
+  ifelse(grepl("unclassified|incertae|Unknown", x, ignore.case = TRUE), NA, x)
+}
+
+tax_clean <- tax_raw %>%
+  mutate(across(c(Kingdom, Phylum, Class, Order, Family, Genus), clean_rank)) %>%
+  mutate(lineage = paste(
+    ifelse(is.na(Kingdom), "Bacteria",       Kingdom),
+    ifelse(is.na(Phylum),  "Unknown_Phylum", Phylum),
+    ifelse(is.na(Class),   "Unknown_Class",  Class),
+    ifelse(is.na(Order),   "Unknown_Order",  Order),
+    ifelse(is.na(Family),  "Unknown_Family", Family),
+    ifelse(is.na(Genus),   "Unknown_Genus",  Genus),
+    sep = ";"
+  ))
+
+# ============================================================================
+# 5. BUILD METACODER OBJECT
+# ============================================================================
+# Combine OTU table (OTUs as rows, samples as columns) with lineage
+otu_df <- as.data.frame(t(otu_rare)) %>%
+  rownames_to_column("OTU") %>%
+  left_join(dplyr::select(tax_clean, OTU, lineage), by = "OTU")
+
+cat("OTU table dimensions:", nrow(otu_df), "OTUs x", ncol(otu_df)-2, "samples\n")
+
+obj <- parse_tax_data(
+  otu_df,
+  class_cols  = "lineage",
+  class_sep   = ";",
+  class_regex = "^(.+)$",
+  class_key   = c(tax_name = "taxon_name")
+)
+
+cat("Taxmap object created:", "\n")
+print(obj)
+
+# ============================================================================
+# 6. FILTER LOW-ABUNDANCE OTUs
+# ============================================================================
+# Set counts < 5 to zero
+obj$data$tax_data <- zero_low_counts(obj, data = "tax_data", min_count = 5)
+
+# Remove OTUs with no reads
+no_reads <- rowSums(obj$data$tax_data[, samples]) == 0
+obj <- filter_obs(obj, data = "tax_data", !no_reads, drop_taxa = TRUE)
+cat("After filtering:", nrow(obj$data$tax_data), "OTUs remaining\n")
+
+# ============================================================================
+# 7. FILTER TO FAMILY LEVEL AND ABOVE
+# ============================================================================
+# Use n_supertaxa() to get the number of ancestors per taxon
+# Root = 0 ancestors, Phylum = 1, Class = 2, Order = 3, Family = 4, Genus = 5
+# Keep Order and above: n_supertaxa <= 3
+
+n_super <- n_supertaxa(obj)
+cat("\nSupertaxa count distribution (5 = Genus):\n")
+print(table(n_super))
+
+# Keep Order and above (n_supertaxa <= 3)
+obj_family <- filter_taxa(obj,
+                          n_super <= 3,
+                          reassign_obs = TRUE)
+
+cat("\nTaxa remaining at Order level and above:", nrow(obj_family$data$tax_data), "\n")
+obj <- obj_family
+
+# ============================================================================
+# 8. COMPUTE TAXON COUNTS PER SAMPLE
+# ============================================================================
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data", cols = samples)
+
+# Add sample metadata
+obj$data$sample_data <- tibble(
+  sample_id       = samples,
+  Treatment_label = meta_raw$Treatment_label[match(samples, meta_raw$SampleID)]
+)
+
+# ============================================================================
+# 9. PAIRWISE COMPARISONS — all 6 pairs
+# ============================================================================
+TRT_ORDER <- c("Control+Water","Control+SMT","Strep+Water","Strep+SMT")
+pairs <- combn(TRT_ORDER, 2, simplify = FALSE)
+
+# Colours matching your paper scheme
+BLUE   <- "#1C66C0"
+RED    <- "#C0392B"
+GRAY   <- "#888888"
+
+trt_colors <- c(
+  "Control+Water" = BLUE,
+  "Control+SMT"   = BLUE,
+  "Strep+Water"   = RED,
+  "Strep+SMT"     = RED
+)
+
+# ============================================================================
+# 10. PLOT EACH PAIRWISE HEAT TREE
+# ============================================================================
+pdf("figure_metacoder_heattree_order_pairwise_grey_02.pdf",
+    width = 18, height = 12)
+
+par(mfrow = c(2, 3))
+
+# Collect enrichment counts and detailed taxon data across all pairs
+enrichment_summary <- data.frame()
+all_pair_exports   <- data.frame()
+
+for (pair in pairs) {
+  trt_a <- pair[1]
+  trt_b <- pair[2]
+
+  cat("\nComparing:", trt_a, "vs", trt_b, "\n")
+
+  # Get sample IDs for each group
+  samp_a <- meta_raw$SampleID[meta_raw$Treatment_label == trt_a]
+  samp_b <- meta_raw$SampleID[meta_raw$Treatment_label == trt_b]
+
+  # Calculate log2 median ratio between groups
+  obj$data$diff_table <- compare_groups(
+    obj,
+    data       = "tax_abund",
+    cols       = samples,
+    groups     = meta_raw$Treatment_label[match(samples, meta_raw$SampleID)]
+  )
+
+  # Print column names on first iteration to diagnose
+  if (identical(pair, pairs[[1]])) {
+    cat("compare_groups columns:", colnames(obj$data$diff_table), "\n")
+  }
+
+  # Filter to this pair
+  pair_diff <- obj$data$diff_table %>%
+    dplyr::filter(treatment_1 == trt_a, treatment_2 == trt_b)
+
+  # FDR correction — handle both old (wilcox_p) and new (p_value) column names
+  # Column is wilcox_p_value in this version of metacoder
+  obj$data$diff_table <- obj$data$diff_table %>%
+    mutate(wilcox_p_adj = p.adjust(wilcox_p_value, method = "fdr"))
+
+  # Use metacoder default diverging palette
+  col_a <- "#D55E00"    # orange = trt_a enriched (default metacoder)
+  col_b <- "#0072B2"    # blue   = trt_b enriched (default metacoder)
+
+  # Filter diff_table to this pair only before plotting
+  full_diff <- obj$data$diff_table
+  obj$data$diff_table <- full_diff %>%
+    dplyr::filter(treatment_1 == trt_a, treatment_2 == trt_b)
+
+  print(
+    heat_tree(obj,
+              node_label            = taxon_names,
+              node_size             = n_obs,
+              node_color            = log2_median_ratio,
+              node_color_interval   = c(-0.2, 0.2),
+              node_color_range      = c("#009E73", "#009E73", "gray90", "gray90", "#D55E00", "#D55E00"),
+              node_size_axis_label  = "OTU count",
+              node_color_axis_label = paste0(
+                trt_a, " (orange) \n",
+                trt_b, " (blue) \n",
+                "log2 ratio"
+              ),
+              node_label_size_range = c(0.01, 0.04),
+              # Edge (branch) colour matches node enrichment direction
+              edge_color            = log2_median_ratio,
+              edge_color_interval   = c(-0.2, 0.2),
+              edge_color_range      = c("#009E73", "#009E73", "gray90", "gray90", "#D55E00", "#D55E00"),
+              edge_size             = 0.0025,
+              edge_size_range       = c(0.002, 0.006),
+              layout                = "davidson-harel",
+              initial_layout        = "reingold-tilford",
+              title                 = paste0(trt_a, "  vs  ", trt_b),
+              title_size            = 0.04,
+              output_file           = NULL
+    )
+  )
+
+  # ── Count enriched taxa per comparison ──────────────────────────────────────
+  pair_stats <- obj$data$diff_table %>%
+    dplyr::filter(!is.na(log2_median_ratio)) %>%
+    dplyr::summarise(
+      total_taxa       = dplyr::n(),
+      enriched_in_a    = sum(log2_median_ratio > 0, na.rm = TRUE),
+      enriched_in_b    = sum(log2_median_ratio < 0, na.rm = TRUE),
+      neutral          = sum(log2_median_ratio == 0, na.rm = TRUE),
+      sig_enriched_a   = sum(log2_median_ratio > 0 & wilcox_p_adj < 0.05, na.rm = TRUE),
+      sig_enriched_b   = sum(log2_median_ratio < 0 & wilcox_p_adj < 0.05, na.rm = TRUE)
+    )
+
+  cat(sprintf(
+    "  Total taxa compared: %d\n  %s enriched: %d total (%d FDR sig p<0.05)\n  %s enriched: %d total (%d FDR sig p<0.05)\n  Neutral: %d\n",
+    pair_stats$total_taxa,
+    trt_a, pair_stats$enriched_in_a, pair_stats$sig_enriched_a,
+    trt_b, pair_stats$enriched_in_b, pair_stats$sig_enriched_b,
+    pair_stats$neutral
+  ))
+
+  # Add to summary table
+  enrichment_summary <- rbind(enrichment_summary, data.frame(
+    Comparison        = paste(trt_a, "vs", trt_b),
+    Treatment_A       = trt_a,
+    Treatment_B       = trt_b,
+    Total_taxa        = pair_stats$total_taxa,
+    Enriched_A        = pair_stats$enriched_in_a,
+    Enriched_B        = pair_stats$enriched_in_b,
+    Neutral           = pair_stats$neutral,
+    Sig_enriched_A    = pair_stats$sig_enriched_a,
+    Sig_enriched_B    = pair_stats$sig_enriched_b,
+    stringsAsFactors  = FALSE
+  ))
+
+  # ── Export detailed taxon enrichment for this pair ───────────────────────────
+  # Build taxonomy lookup directly from tax_clean (original taxonomy table)
+  # tax_clean has Kingdom, Phylum, Class, Order, Family, Genus and lineage columns
+  # Join diff_table taxon names to tax_clean via the taxon name
+
+  # Get taxon name for each taxon_id in the diff_table
+  tname_vec <- taxon_names(obj)  # named vector: id -> name
+  tname_df  <- data.frame(
+    taxon_id = names(tname_vec),
+    tax_name = unname(tname_vec),
+    stringsAsFactors = FALSE
+  )
+
+  # Get n_supertaxa for filtering to family level only
+  n_super_now <- n_supertaxa(obj)
+  order_ids   <- names(n_super_now)[n_super_now == 3]
+
+  pair_export <- full_diff %>%
+    dplyr::filter(treatment_1 == trt_a, treatment_2 == trt_b) %>%
+    left_join(tname_df, by = "taxon_id") %>%
+    # Keep only order-level taxa
+    dplyr::filter(taxon_id %in% order_ids) %>%
+    # Join to tax_clean on Family name to get full taxonomy
+    left_join(
+      tax_clean %>%
+        dplyr::filter(!is.na(Order) &
+                      !grepl("unclassified|Unknown", Order,
+                              ignore.case = TRUE)) %>%
+        dplyr::select(Kingdom, Phylum, Class, Order) %>%
+        dplyr::distinct(Order, .keep_all = TRUE),
+      by = c("tax_name" = "Order")
+    ) %>%
+    dplyr::mutate(
+      comparison  = paste(trt_a, "vs", trt_b),
+      direction   = dplyr::case_when(
+        log2_median_ratio > 0 ~ paste("Enriched in", trt_a),
+        log2_median_ratio < 0 ~ paste("Enriched in", trt_b),
+        TRUE                  ~ "Neutral"
+      ),
+      significant = wilcox_p_adj < 0.05
+    ) %>%
+    dplyr::select(comparison, taxon_id,
+                  Order = tax_name,
+                  Class, Phylum, Kingdom,
+                  log2_median_ratio, mean_diff,
+                  wilcox_p_value, wilcox_p_adj,
+                  direction, significant) %>%
+    dplyr::arrange(desc(abs(log2_median_ratio)))
+
+  # Append to master export
+  all_pair_exports <- rbind(all_pair_exports, pair_export)
+
+  # Restore full diff_table for next iteration
+  obj$data$diff_table <- full_diff
+}
+
+# ── Save master CSV ───────────────────────────────────────────────────────────
+write.csv(all_pair_exports,
+          "metacoder_taxon_enrichment_order_full.csv",
+          row.names = FALSE)
+cat("\nSaved: metacoder_taxon_enrichment_order_full.csv\n")
+
+# ── Phylum-level summary ──────────────────────────────────────────────────────
+phylum_summary <- all_pair_exports %>%
+  dplyr::filter(!is.na(Phylum), direction != "Neutral") %>%
+  dplyr::group_by(comparison, Phylum, direction) %>%
+  dplyr::summarise(
+    n_orders          = dplyr::n(),
+    orders            = paste(sort(unique(Order)), collapse = "; "),
+    mean_log2_ratio   = round(mean(log2_median_ratio, na.rm = TRUE), 3),
+    max_log2_ratio    = round(max(abs(log2_median_ratio), na.rm = TRUE), 3),
+    n_significant     = sum(significant, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(comparison, Phylum, direction)
+
+write.csv(phylum_summary,
+          "metacoder_order_enrichment_summary.csv",
+          row.names = FALSE)
+cat("Saved: metacoder_order_enrichment_summary.csv\n")
+
+cat("\nPhylum enrichment preview:\n")
+print(as.data.frame(phylum_summary))
+
+# ── SUMMARY TABLE across all comparisons ─────────────────────────────────────
+cat("\n", paste(rep("=", 65), collapse=""), "\n")
+cat("ENRICHMENT SUMMARY — all pairwise comparisons (Family level)\n")
+cat(paste(rep("=", 65), collapse=""), "\n\n")
+print(enrichment_summary)
+cat("\n")
+
+# Save summary to CSV
+write.csv(enrichment_summary,
+          "metacoder_enrichment_summary_family.csv",
+          row.names = FALSE)
+cat("Saved: metacoder_enrichment_summary_family.csv\n")
+
+dev.off()
+cat("\nSaved: figure_metacoder_heattree_order_pairwise_grey_02.pdf\n")
+
+# ============================================================================
+# 11. COMBINED MATRIX PLOT (heat_tree_matrix)
+# ============================================================================
+# This makes a grid of all pairwise comparisons in one figure
+
+cat("\nGenerating heat_tree_matrix...\n")
+
+# Compute comparisons for all groups at once
+obj$data$diff_table <- compare_groups(
+  obj,
+  data   = "tax_abund",
+  cols   = samples,
+  groups = meta_raw$Treatment_label[match(samples, meta_raw$SampleID)]
+)
+
+# Handle column naming differences across metacoder versions
+obj$data$diff_table <- obj$data$diff_table %>%
+  mutate(
+    log2_median_ratio = ifelse(is.finite(log2_median_ratio),
+                               log2_median_ratio, 0),
+    wilcox_p_adj = p.adjust(wilcox_p_value, method = "fdr")
+  )
+
+# Force close ALL open graphics devices before writing new file
+while (!is.null(dev.list())) dev.off()
+graphics.off()
+
+# Use a unique timestamped filename to avoid file lock issues
+matrix_file <- paste0("figure_metacoder_heattree_order_matrix_grey_02_",
+                       format(Sys.time(), "%H%M%S"), ".pdf")
+
+set.seed(42)
+heat_tree_matrix(
+  obj,
+  data                     = "diff_table",
+  key_size                 = 0.67,
+  node_label               = taxon_names,
+  node_size                = n_obs,
+  node_color               = log2_median_ratio,
+  node_color_range         = c("#009E73", "#009E73", "gray90", "gray90", "#D55E00", "#D55E00"),
+  node_color_interval      = c(-0.2, 0.2),
+  edge_color               = log2_median_ratio,
+  edge_color_range         = c("#009E73", "#009E73", "gray90", "gray90", "#D55E00", "#D55E00"),
+  edge_color_interval      = c(-0.2, 0.2),
+  edge_size                = 0.0025,
+  edge_size_range          = c(0.002, 0.006),
+  node_size_axis_label     = "OTU count",
+  node_color_axis_label    = "Log2 ratio",
+  node_label_size_range    = c(0.008, 0.035),
+  layout                   = "davidson-harel",
+  initial_layout           = "reingold-tilford",
+  output_file              = matrix_file
+)
+cat("\nSaved matrix:", matrix_file, "\n")
+
+cat("Saved: figure_metacoder_heattree_matrix_blue_red.pdf\n")
+
+
+# ============================================================================
+# 12. ALL-GREY REFERENCE TREE (taxonomy structure key, no enrichment colour)
+# ============================================================================
+# This tree shows node size (OTU count) only, with all nodes/edges grey —
+# useful as a structural reference/key alongside the coloured comparison trees
+
+while (!is.null(dev.list())) dev.off()
+graphics.off()
+
+ref_file <- paste0("figure_metacoder_heattree_REFERENCE_grey_",
+                    format(Sys.time(), "%H%M%S"), ".pdf")
+
+pdf(ref_file, width = 10, height = 10)
+
+print(
+  heat_tree(obj,
+            node_label            = taxon_names,
+            node_size             = n_obs,
+            node_color            = "grey70",
+            edge_color            = "grey70",
+            node_size_axis_label  = "OTU count",
+            node_label_size_range = c(0.01, 0.04),
+            layout                = "davidson-harel",
+            initial_layout        = "reingold-tilford",
+            title                 = "Reference tree (taxonomy structure)",
+            title_size            = 0.04,
+            output_file           = NULL
+  )
+)
+
+dev.off()
+cat("\nSaved reference tree:", ref_file, "\n")
+
+
+# ============================================================================
+# 13. CIRCULAR LEGEND — matching the heat tree colour scale
+# ============================================================================
+# Creates a standalone circular legend PNG matching the published figure style
+
+library(ggplot2)
+library(grid)
+
+TEAL  <- "#009E73"
+BROWN <- "#D55E00"
+GRAY  <- "gray90"
+
+# ── Colour scale circles (log2 ratio) ────────────────────────────────────────
+legend_color_df <- data.frame(
+  x     = rep(1, 7),
+  y     = seq(7, 1, by = -1),
+  fill  = c(TEAL, TEAL, TEAL, GRAY, BROWN, BROWN, BROWN),
+  label = c("-2.0", "-1.0", "-0.2", "0.0", "0.2", "1.0", "2.0"),
+  size  = rep(8, 7)
+)
+
+# ── Node size circles (OTU count) ────────────────────────────────────────────
+legend_size_df <- data.frame(
+  x     = rep(3, 5),
+  y     = c(7, 5.5, 4, 2.5, 1),
+  fill  = rep("gray60", 5),
+  label = c("1", "50", "200", "500", "1000"),
+  size  = c(3, 5, 8, 11, 14)
+)
+
+p_legend <- ggplot() +
+  # ── Colour scale ──────────────────────────────────────────────────────────
+  geom_point(data = legend_color_df,
+             aes(x = x, y = y, fill = fill),
+             shape = 21, size = 10, colour = "black", stroke = 0.5) +
+  scale_fill_identity() +
+  geom_text(data = legend_color_df,
+            aes(x = x + 0.35, y = y, label = label),
+            hjust = 0, size = 4, colour = "black") +
+  # Colour scale title
+  annotate("text", x = 1, y = 7.8,
+           label = "Log\u2082 ratio of\nmedian proportions",
+           hjust = 0.5, vjust = 0, size = 4.5, fontface = "bold",
+           colour = "black") +
+  # Teal circle label (top)
+  annotate("text", x = 1, y = 7.5,
+           label = "trt_b enriched",
+           hjust = 0.5, size = 3.5, colour = TEAL, fontface = "italic") +
+  # Brown circle label (bottom)
+  annotate("text", x = 1, y = 0.5,
+           label = "trt_a enriched",
+           hjust = 0.5, size = 3.5, colour = BROWN, fontface = "italic") +
+
+  # ── Node size scale ────────────────────────────────────────────────────────
+  geom_point(data = legend_size_df,
+             aes(x = x, y = y, size = size),
+             shape = 21, fill = "gray60", colour = "black", stroke = 0.5) +
+  scale_size_identity() +
+  geom_text(data = legend_size_df,
+            aes(x = x + 0.5, y = y, label = label),
+            hjust = 0, size = 4, colour = "black") +
+  annotate("text", x = 3, y = 7.8,
+           label = "OTU count\n(node size)",
+           hjust = 0.5, vjust = 0, size = 4.5, fontface = "bold",
+           colour = "black") +
+
+  xlim(0.3, 5) + ylim(0, 8.5) +
+  theme_void() +
+  theme(plot.background = element_rect(fill = "white", colour = NA))
+
+ggsave("metacoder_circular_legend.pdf", p_legend,
+       width = 4, height = 6, dpi = 300)
+ggsave("metacoder_circular_legend.png", p_legend,
+       width = 4, height = 6, dpi = 300)
+cat("\nSaved: metacoder_circular_legend.pdf and .png\n")
+cat("Tip: composite this legend with the heat_tree_matrix PDF in Illustrator/Inkscape\n")
+
+##################################################################################
+# Weighted and unweighted UniFrac
+##################################################################################
+# ============================================================================
+# 1. BUILD PHYLOSEQ OBJECT & RAREFY
+# ============================================================================
+otu_ps     <- otu_table(as.matrix(otu_raw), taxa_are_rows = TRUE)
+tax_ps     <- tax_table(as.matrix(tax_raw))
+tree_ps    <- read_tree(TREE_PATH)
+tree_ps    <- ape::root(tree_ps, outgroup = tree_ps$tip.label[1], resolve.root = TRUE)
+meta_ps    <- meta_raw %>% column_to_rownames("SampleID")
+sample_ps  <- sample_data(meta_ps)
+
+ps <- phyloseq(otu_ps, tax_ps, sample_ps, tree_ps)
+
+set.seed(42)
+min_depth <- min(sample_sums(ps))
+cat("Rarefying to", format(min_depth, big.mark = ","), "reads per sample\n")
+ps_rare <- rarefy_even_depth(ps, sample.size = min_depth,
+                              rngseed = 42, replace = FALSE, verbose = FALSE)
+
+# ============================================================================
+# 2. TREATMENT LABELS, COLOURS & SHAPES
+# ============================================================================
+trt_level_order <- c("Control+Water", "Control+SMT", "Strep+Water", "Strep+SMT")
+
+BLUE <- "#1C66C0"
+RED  <- "#C0392B"
+
+trt_colors <- c(
+  "Control+Water" = BLUE,
+  "Control+SMT"   = BLUE,
+  "Strep+Water"   = RED,
+  "Strep+SMT"     = RED
+)
+
+# Circle = Control, Triangle = Strep
+trt_shapes <- c(
+  "Control+Water" = 21,
+  "Control+SMT"   = 21,
+  "Strep+Water"   = 24,
+  "Strep+SMT"     = 24
+)
+
+# Grey border = SMT, black border = no SMT
+trt_stroke <- c(
+  "Control+Water" = "black",
+  "Control+SMT"   = "#AAAAAA",
+  "Strep+Water"   = "black",
+  "Strep+SMT"     = "#AAAAAA"
+)
+
+sample_data(ps_rare)$Treatment_label <- factor(
+  case_when(
+    sample_data(ps_rare)$Treatment == "T1" ~ "Control+Water",
+    sample_data(ps_rare)$Treatment == "T2" ~ "Control+SMT",
+    sample_data(ps_rare)$Treatment == "T3" ~ "Strep+Water",
+    sample_data(ps_rare)$Treatment == "T4" ~ "Strep+SMT"
+  ),
+  levels = trt_level_order
+)
+
+sample_data(ps_rare)$Treatment2 <- trimws(
+  as.character(sample_data(ps_rare)$Treatment2)
+)
+
+# ============================================================================
+# 3. PERMANOVA
+# ============================================================================
+cat("\nRunning PERMANOVA (Bray-Curtis, Unweighted UniFrac, Weighted UniFrac)...\n")
+
+uf_dist  <- UniFrac(ps_rare, weighted = FALSE, normalized = TRUE)
+wuf_dist <- UniFrac(ps_rare, weighted = TRUE,  normalized = TRUE)
+
+trt_vec  <- as.character(sample_data(ps_rare)$Treatment_label)
+
+perm_uf  <- adonis2(uf_dist  ~ trt_vec, permutations = 999)
+perm_wuf <- adonis2(wuf_dist ~ trt_vec, permutations = 999)
+
+cat("\nUnweighted UniFrac PERMANOVA:\n"); print(perm_uf)
+cat("\nWeighted UniFrac PERMANOVA:\n");   print(perm_wuf)
+
+fmt_p <- function(p) {
+  case_when(p < 0.001 ~ "< 0.001", p < 0.01 ~ "< 0.01",
+            p < 0.05  ~ "< 0.05",  TRUE ~ paste0("= ", round(p, 3)))
+}
+perm_uf_label  <- paste0("PERMANOVA  p ", fmt_p(perm_uf$`Pr(>F)`[1]))
+perm_wuf_label <- paste0("PERMANOVA  p ", fmt_p(perm_wuf$`Pr(>F)`[1]))
+
+# ============================================================================
+# 4. PCoA ORDINATIONS
+# ============================================================================
+cat("\nComputing PCoA ordinations...\n")
+ord_uf  <- ordinate(ps_rare, method = "PCoA", distance = uf_dist)
+ord_wuf <- ordinate(ps_rare, method = "PCoA", distance = wuf_dist)
+
+get_pct <- function(ord) {
+  eig     <- ord$values$Eigenvalues
+  eig_pos <- eig[eig > 0]
+  round(eig_pos / sum(eig_pos) * 100, 1)
+}
+pct_uf  <- get_pct(ord_uf)
+pct_wuf <- get_pct(ord_wuf)
+cat("Unweighted UniFrac — PC1:", pct_uf[1], "%  PC2:", pct_uf[2], "%\n")
+cat("Weighted UniFrac   — PC1:", pct_wuf[1], "%  PC2:", pct_wuf[2], "%\n")
+
+# ============================================================================
+# 5. DC-STYLE THEME
+# ============================================================================
+dc_theme <- theme_classic(base_size = 15) +
+  theme(
+    panel.border  = element_rect(colour = "black", fill = NA, linewidth = 1.0),
+    axis.text     = element_text(size = 20, color = "black"),
+    axis.title    = element_text(size = 24, color = "black"),
+    legend.title  = element_text(size = 13, color = "black"),
+    legend.text   = element_text(size = 12, color = "black"),
+    plot.title    = element_text(size = 15, color = "black"),
+    text          = element_text(color = "black")
+  )
+
+# ============================================================================
+# 6. ORDINATION PLOT HELPER
+# ============================================================================
+make_ord_plot <- function(ord, ps_obj, pct, perm_label, title) {
+
+  # Extract coordinates
+  coords <- as.data.frame(ord$vectors[, 1:2])
+  colnames(coords) <- c("PC1", "PC2")
+  coords$SampleID  <- rownames(coords)
+
+  plot_df <- coords %>%
+    left_join(
+      data.frame(sample_data(ps_obj)) %>% rownames_to_column("SampleID"),
+      by = "SampleID"
+    )
+
+  # Ellipses (std dev, drawn manually so they match theme)
+  # SMT overlay data
+  smt_df <- plot_df %>% filter(Treatment2 == "SMT")
+
+  ggplot(plot_df, aes(x = PC1, y = PC2)) +
+    # 95% confidence ellipses per treatment
+    stat_ellipse(aes(colour = Treatment_label),
+                 type = "norm", level = 0.95,
+                 linewidth = 1.0, linetype = "dashed") +
+    # sample points — fill=treatment, shape=Control/Strep, stroke=SMT/no SMT
+    geom_point(aes(fill   = Treatment_label,
+                   shape  = Treatment_label,
+                   colour = Treatment_label),
+               size = 6, alpha = 0.75, stroke = 0.9) +
+    # unicode polka dot overlay for SMT samples
+    { if (nrow(smt_df) > 0)
+        geom_text(data = smt_df,
+                  aes(x = PC1, y = PC2, label = "⁛"),
+                  colour = "white", size = 3.5, fontface = "bold",
+                  hjust = 0.5, vjust = 0.5, inherit.aes = FALSE)
+      else list() } +
+    scale_fill_manual(values   = trt_colors, name = "Treatment") +
+    scale_colour_manual(values = trt_stroke,  guide = "none") +
+    scale_shape_manual(values  = trt_shapes,  name = "Treatment") +
+    annotate("text",
+             x = Inf, y = Inf,
+             label = perm_label,
+             hjust = 1.1, vjust = 1.3,
+             size = 5, colour = "black", fontface = "italic") +
+    labs(
+      title = title,
+      x     = paste0("PC1  (", pct[1], "% variance)"),
+      y     = paste0("PC2  (", pct[2], "% variance)")
+    ) +
+    dc_theme +
+    guides(
+      fill  = guide_legend(override.aes = list(
+                shape  = c(21, 21, 24, 24),
+                colour = c("black","#AAAAAA","black","#AAAAAA"),
+                size   = 5)),
+      shape = "none"
+    )
+}
+
+# ============================================================================
+# 7. BUILD PLOTS
+# ============================================================================
+fig_uf <- make_ord_plot(
+  ord_uf,  ps_rare, pct_uf,  perm_uf_label,
+  "Unweighted UniFrac PCoA"
+)
+
+fig_wuf <- make_ord_plot(
+  ord_wuf, ps_rare, pct_wuf, perm_wuf_label,
+  "Weighted UniFrac PCoA"
+)
+
+# ============================================================================
+# 8. SAVE — individual PNGs + combined
+# ============================================================================
+ggsave("unifrac_unweighted_pcoa.pdf", fig_uf,  width = 8, height = 7, dpi = 300)
+ggsave("unifrac_unweighted_pcoa.png", fig_uf,  width = 8, height = 7, dpi = 300)
+cat("\nSaved: unifrac_unweighted_pcoa.png\n")
+
+ggsave("unifrac_weighted_pcoa.pdf",   fig_wuf, width = 8, height = 7, dpi = 300)
+ggsave("unifrac_weighted_pcoa.png",   fig_wuf, width = 8, height = 7, dpi = 300)
+cat("Saved: unifrac_weighted_pcoa.png\n")
+
+# Combined side-by-side
+library(patchwork)
+combined <- fig_uf + fig_wuf +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    theme = theme(
+      plot.title    = element_blank(),
+      plot.subtitle = element_blank()
+    )
+  ) &
+  theme(legend.position = "bottom")
+
+ggsave("unifrac_pcoa_combined.pdf", combined, width = 16, height = 7, dpi = 1200)
+ggsave("unifrac_pcoa_combined.png", combined, width = 15, height = 8, dpi = 1200)
+cat("Saved: unifrac_pcoa_combined.png\n")
+#################################################################################
+# Beta NTI
+#Load the library below
+#################################################################################
+
+library(ggplot2)
+library(dplyr)
+library(ggpattern)
+library(multcompView)
+
+# ============================================================================
+# COLOURS, SHAPES & THEME
+# ============================================================================
+BLUE <- "#1C66C0"
+RED  <- "#C0392B"
+
+treatment_colors <- c(
+  "1_Control+Water" = BLUE,
+  "2_Control+SMT"   = BLUE,
+  "3_Strep+Water"   = RED,
+  "4_Strep+SMT"     = RED
+)
+
+treatment_shapes <- c(
+  "1_Control+Water" = 21,
+  "2_Control+SMT"   = 21,
+  "3_Strep+Water"   = 24,
+  "4_Strep+SMT"     = 24
+)
+
+dc_theme <- theme_classic(base_size = 15) +
+  theme(
+    panel.border  = element_rect(colour = "black", fill = NA, linewidth = 1.0),
+    axis.text     = element_text(size = 20, color = "black"),
+    axis.text.x   = element_text(angle = 20, hjust = 1, size = 20,
+                                  color = "black"),
+    axis.title    = element_text(size = 24, color = "black"),
+    axis.title.y  = element_text(size = 24, color = "black"),
+    axis.ticks    = element_line(color = "black"),
+    legend.title  = element_text(size = 13, color = "black"),
+    legend.text   = element_text(size = 12, color = "black"),
+    plot.title    = element_text(size = 15, color = "black"),
+    plot.subtitle = element_text(size = 11, colour = "black"),
+    text          = element_text(color = "black"),
+    legend.position = "right"
+  )
+
+# ============================================================================
+# DATA PREP 
+# ============================================================================
+
+# ── Expected: beta_df has columns Value and Treatment1 ───────────────────────
+# If coming from t2$res_group_distance:
+#   beta_df <- t2$res_group_distance
+#   colnames(beta_df) <- c("Value", "Treatment1")
+
+# Add Treatment2 (SMT vs No_SMT) based on treatment name
+beta_df$Treatment2 <- ifelse(
+  grepl("SMT", beta_df$Treatment1), "SMT", "No_SMT"
+)
+
+# Add is_SMT flag for polka pattern
+beta_df$is_SMT <- beta_df$Treatment2 == "SMT"
+
+# Ensure correct factor order
+beta_df$Treatment1 <- factor(
+  beta_df$Treatment1,
+  levels = c("1_Control+Water","2_Control+SMT",
+             "3_Strep+Water",  "4_Strep+SMT")
+)
+
+# Clean x-axis labels (remove number prefix for display)
+x_labels <- c(
+  "1_Control+Water" = "Control+Water",
+  "2_Control+SMT"   = "Control+SMT",
+  "3_Strep+Water"   = "Strep+Water",
+  "4_Strep+SMT"     = "Strep+SMT"
+)
+
+# ============================================================================
+# TUKEY HSD COMPACT LETTERS
+# ============================================================================
+aov_res   <- aov(Value ~ Treatment1, data = beta_df)
+cat("\nANOVA:\n"); print(summary(aov_res))
+tukey_res <- TukeyHSD(aov_res)
+cat("\nTukey HSD:\n"); print(tukey_res)
+
+p_vals <- tukey_res[["Treatment1"]][, "p adj"]
+ltrs   <- multcompLetters(p_vals)$Letters
+rng    <- diff(range(beta_df$Value, na.rm = TRUE))
+
+letter_df <- data.frame(
+  Treatment1 = names(ltrs),
+  letter     = ltrs,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(
+    beta_df %>%
+      group_by(Treatment1) %>%
+      summarise(y_max = max(Value, na.rm = TRUE), .groups = "drop"),
+    by = "Treatment1"
+  ) %>%
+  mutate(
+    Treatment1 = factor(Treatment1,
+                        levels = levels(beta_df$Treatment1)),
+    y_pos = y_max + rng * 0.08
+  )
+
+# ============================================================================
+# PLOT
+# ============================================================================
+g_bnti <- ggplot(beta_df,
+                  aes(x = Treatment1, y = Value)) +
+
+  # Reference lines
+  geom_hline(yintercept =  2, colour = "#999999", lw = 0.8,
+             linetype = "dashed") +
+  geom_hline(yintercept = -2, colour = "#999999", lw = 0.8,
+             linetype = "dashed") +
+  geom_hline(yintercept =  0, colour = "#CCCCCC", lw = 0.5,
+             linetype = "dotted") +
+
+  # Polka dot boxplot — SMT boxes get white circle pattern
+  geom_boxplot_pattern(
+    aes(fill    = Treatment1,
+        pattern = is_SMT),
+    alpha           = 0.75,
+    outlier.shape   = NA,
+    color           = "black",
+    linewidth       = 0.9,
+    pattern_colour  = "white",
+    pattern_fill    = "white",
+    pattern_spacing = 0.055,
+    pattern_density = 0.35,
+    pattern_size    = 0.4
+  ) +
+  scale_pattern_manual(
+    values = c("TRUE" = "circle", "FALSE" = "none"),
+    guide  = "none"
+  ) +
+
+  # Jitter points — shape by treatment, fill by treatment
+  geom_point(aes(fill  = Treatment1,
+                 shape = Treatment1),
+             color    = "black",
+             size     = 5,
+             alpha    = 0.85,
+             stroke   = 0.8,
+             position = position_jitter(width = 0.12, seed = 42)) +
+
+  # Tukey letters
+  geom_text(data = letter_df,
+            aes(x = Treatment1, y = y_pos, label = letter),
+            inherit.aes = FALSE,
+            size = 0, fontface = "bold", color = "black") +
+
+  # Scales
+  scale_fill_manual(
+    values = treatment_colors,
+    labels = x_labels,
+    name   = "Treatment",
+    guide  = "none"
+  ) +
+  scale_shape_manual(
+    values = treatment_shapes,
+    labels = x_labels,
+    name   = "Treatment"
+  ) +
+  scale_x_discrete(labels = x_labels) +
+  scale_y_continuous(
+    limits = c(
+      min(beta_df$Value, na.rm = TRUE) - rng * 0.05,
+      max(beta_df$Value, na.rm = TRUE) + rng * 0.45
+    )
+  ) +
+
+  # Annotation for reference lines
+  annotate("text", x = 0.6, y = 2.15,
+           label = "βNTI > 2 (variable selection)",
+           hjust = 0, size = 3.5, colour = "#777777", fontface = "italic") +
+  annotate("text", x = 0.6, y = -2.15,
+           label = "βNTI < −2 (homogeneous selection)",
+           hjust = 0, size = 3.5, colour = "#777777", fontface = "italic") +
+
+  labs(
+    title    = "βNTI by Treatment",
+    subtitle = "One-way ANOVA + Tukey HSD  |  dashed lines = ±2 threshold",
+    x        = NULL,
+    y        = "\u03b2NTI"
+  ) +
+  dc_theme +
+  guides(
+    shape = guide_legend(
+      override.aes = list(
+        fill   = c(BLUE, BLUE, RED, RED),
+        colour = "black",
+        size   = 5
+      )
+    )
+  )
+
+# ============================================================================
+# SAVE
+# ============================================================================
+ggsave("figure_betaNTI.pdf", g_bnti, width = 4,  height = 8,  dpi = 1200)
+ggsave("figure_betaNTI.png", g_bnti, width = 5,  height = 8,  dpi = 1200)
+cat("\nSaved: figure_betaNTI.pdf  and  figure_betaNTI.png\n")
+
+###############################################################################
+# Heatmap (genus × genes/AUDPC) + LEfSe LDA bar chart
+# Bars perfectly aligned to heatmap row heights
+###############################################################################
+
+library(tidyverse)
+library(readxl)
+library(patchwork)
+library(ggpattern)
+
+# ============================================================================
+# 1. FILE PATHS
+# ============================================================================
+OTU_PATH     <- "OTU.csv"
+TAX_PATH     <- "TAX.csv"
+META_PATH    <- "Metadata.csv"
+ABIOTIC_PATH <- "PJ_2_Microbiome_Next_Gen_ALL_DataSetsss.xlsx"
+
+# ============================================================================
+# 2. LOAD & RAREFY OTU
+# ============================================================================
+library(vegan)
+otu_raw  <- read.csv(OTU_PATH, row.names = 1, check.names = FALSE)
+tax_raw  <- read.csv(TAX_PATH, row.names = 1, check.names = FALSE)
+meta_raw <- read.csv(META_PATH, check.names = FALSE)
+colnames(meta_raw) <- gsub("[\u00a0\\s]+", "", colnames(meta_raw), perl = TRUE)
+meta_raw$SampleID  <- trimws(as.character(meta_raw$SampleName))
+meta_raw <- meta_raw %>%
+  mutate(Treatment  = trimws(as.character(Treatment)),
+         Treatment1 = trimws(as.character(Treatment1)),
+         Treatment2 = trimws(as.character(Treatment2)),
+         Block      = as.integer(Block),
+         Experiment = as.integer(Experiment))
+
+samples <- meta_raw$SampleID
+otu_t   <- t(as.matrix(otu_raw[, samples]))   # samples x OTUs
+
+set.seed(42)
+min_depth <- min(rowSums(otu_t))
+cat("Rarefying to", format(min_depth, big.mark = ","), "reads\n")
+otu_rare <- rrarefy(otu_t, sample = min_depth)
+otu_rel  <- otu_rare / rowSums(otu_rare)      # relative abundance
+
+# ============================================================================
+# 3. COLLAPSE TO GENUS LEVEL
+# ============================================================================
+clean_label <- function(row) {
+  for (rank in c("Genus","Family","Order","Class","Phylum")) {
+    val <- as.character(row[[rank]])
+    if (!is.na(val) && val != "" &&
+        !grepl("unclassified|incertae|Unknown", val, ignore.case = TRUE)) {
+      suffix <- substr(rank, 1, 1)
+      return(paste0(val, " (", suffix, ")"))
+    }
+  }
+  return(as.character(row[["Phylum"]]))
+}
+
+tax_raw$genus_label <- apply(tax_raw, 1, clean_label)
+
+# Aggregate: for each genus_label, sum relative abundance across OTUs
+otu_rel_df  <- as.data.frame(otu_rel)
+genus_counts <- lapply(unique(tax_raw$genus_label), function(gl) {
+  otus <- rownames(tax_raw)[tax_raw$genus_label == gl]
+  otus <- intersect(otus, colnames(otu_rel_df))
+  if (length(otus) == 1) otu_rel_df[, otus]
+  else rowSums(otu_rel_df[, otus])
+})
+genus_df <- as.data.frame(do.call(cbind, genus_counts))
+colnames(genus_df) <- unique(tax_raw$genus_label)
+rownames(genus_df) <- samples
+
+# Filter: present in >= 5 samples
+keep <- colnames(genus_df)[colSums(genus_df > 0) >= 5]
+genus_df <- genus_df[, keep]
+cat("Genus-level taxa (>=5 samples):", ncol(genus_df), "\n")
+
+# ============================================================================
+# 4. LOAD qPCR + AUDPC
+# ============================================================================
+qpcr_raw <- read_excel(ABIOTIC_PATH, sheet = "qPCR", col_names = FALSE)
+qpcr <- qpcr_raw[2:nrow(qpcr_raw), 1:6]
+colnames(qpcr) <- c("Target","Sample","Tech_Rep","Exp","Block","Norm_Expr")
+qpcr <- qpcr %>%
+  mutate(Target    = as.character(Target),
+         Sample    = trimws(as.character(Sample)),
+         Norm_Expr = as.numeric(Norm_Expr),
+         Exp       = as.integer(Exp),
+         Block     = as.integer(Block)) %>%
+  filter(!is.na(Target), !is.na(Norm_Expr))
+
+qpcr_avg <- qpcr %>%
+  group_by(Target, Sample, Exp) %>%
+  summarise(Norm_Expr = mean(Norm_Expr, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Target, values_from = Norm_Expr) %>%
+  rename(Treatment = Sample, Experiment = Exp)
+
+ds_sheet  <- read_excel(ABIOTIC_PATH, sheet = "Disease_Severity_AUDPC",
+                        col_names = FALSE)
+audpc_raw <- ds_sheet[3:nrow(ds_sheet), 30:33]
+colnames(audpc_raw) <- c("Treatment","Block","Experiment","AUDPC")
+audpc_avg <- audpc_raw %>%
+  filter(!is.na(Treatment)) %>%
+  mutate(Treatment  = trimws(as.character(Treatment)),
+         Experiment = as.integer(Experiment),
+         AUDPC      = as.numeric(AUDPC)) %>%
+  group_by(Treatment, Experiment) %>%
+  summarise(AUDPC = mean(AUDPC, na.rm = TRUE), .groups = "drop")
+
+abiotic <- meta_raw %>%
+  left_join(qpcr_avg,  by = c("Treatment","Experiment")) %>%
+  left_join(audpc_avg, by = c("Treatment","Experiment"))
+
+# ============================================================================
+# 5. SPEARMAN CORRELATIONS: genus x (genes + AUDPC)
+# ============================================================================
+target_vars <- c("CHI14","Flg_Sens","Gluc","AUDPC")
+
+corr_results <- lapply(target_vars, function(gene) {
+  gvals <- abiotic[[gene]]
+  lapply(colnames(genus_df), function(taxon) {
+    abund <- genus_df[, taxon]
+    test  <- cor.test(abund, gvals, method = "spearman", exact = FALSE)
+    data.frame(Gene = gene, Taxon = taxon,
+               r = test$estimate, p = test$p.value,
+               stringsAsFactors = FALSE)
+  }) %>% bind_rows()
+}) %>% bind_rows()
+
+# FDR per gene
+corr_results <- corr_results %>%
+  group_by(Gene) %>%
+  mutate(p_adj = p.adjust(p, method = "BH")) %>%
+  ungroup()
+
+# Top 12 per gene by |r|, take union
+top_taxa <- corr_results %>%
+  group_by(Gene) %>%
+  slice_max(abs(r), n = 12) %>%
+  pull(Taxon) %>% unique()
+
+cat("Top taxa selected:", length(top_taxa), "\n")
+
+# ── Pre-compute dominant treatment per taxon for ordering ──────────────────
+genus_meta_tmp <- genus_df %>%
+  rownames_to_column("SampleID") %>%
+  left_join(meta_raw %>% select(SampleID, Treatment1), by = "SampleID") %>%
+  mutate(Treatment1 = trimws(gsub("^\\d+_", "", Treatment1)))
+
+TRT1_ORDER_TMP <- c("Control+Water","Control+SMT","Strep+Water","Strep+SMT")
+
+dominant_trt <- sapply(top_taxa, function(taxon) {
+  means <- sapply(TRT1_ORDER_TMP, function(t)
+    mean(genus_meta_tmp[[taxon]][genus_meta_tmp$Treatment1 == t], na.rm = TRUE))
+  trimws(names(which.max(means)))
+})
+
+# LDA score proxy for within-group ordering
+lda_proxy <- sapply(top_taxa, function(taxon) {
+  X  <- log10(genus_meta_tmp[[taxon]] * 1e6 + 1)
+  y  <- factor(genus_meta_tmp$Treatment1, levels = TRT1_ORDER_TMP)
+  gm <- tapply(X, y, mean)
+  om <- mean(X)
+  log10(sum(sapply(TRT1_ORDER_TMP, function(t)
+    sum(y == t, na.rm = TRUE) * (gm[t] - om)^2),
+    na.rm = TRUE) / length(X) + 1)
+})
+
+# Build ordering data frame: group by treatment then LDA score
+ordering_df <- data.frame(
+  Taxon        = top_taxa,
+  dominant_trt = dominant_trt,
+  lda_proxy    = lda_proxy
+) %>%
+  mutate(trt_order = match(dominant_trt, TRT1_ORDER_TMP)) %>%
+  arrange(trt_order, desc(lda_proxy))
+
+taxa_order <- ordering_df$Taxon
+
+# ── Clean taxon display labels ────────────────────────────────────────────────
+# Remove: numbers in parentheses e.g. (83), (75), (95)
+# Remove: trailing _1, _2, _III, _IV etc
+# Keep:   rank suffix (G), (F), (O), (C), (P)
+clean_taxon_label <- function(x) {
+  x %>%
+    # Remove numbers in parens e.g. Rhodospirillaceae(83) -> Rhodospirillaceae
+    gsub("\\(\\d+\\)", "", .) %>%
+    # Remove _1, _2, _12 etc (underscore + digits only)
+    gsub("_\\d+", "", .) %>%
+    # Remove roman numeral suffixes: _III, _XlVa, _XlVb, _XVIII etc
+    # Catches mixed case like Xl, lV etc — but NOT Gp10, SR1, BRC1, TM7
+    gsub("_[IVXLCivxlc]+[a-z]?\\b", "", .) %>%
+    # Clean up any extra whitespace
+    gsub("\\s+", " ", .) %>%
+    trimws()
+}
+
+# Apply to taxa_order and create a lookup for display
+taxa_labels <- setNames(clean_taxon_label(taxa_order), taxa_order)
+cat("\nTaxon label cleaning:\n")
+changed <- taxa_labels[taxa_labels != taxa_order]
+if (length(changed) > 0) {
+  for (i in seq_along(changed)) {
+    cat("  ", names(changed)[i], "->", changed[i], "\n")
+  }
+} else {
+  cat("  No changes needed\n")
+}
+
+# Pivot for heatmap — use new treatment-based taxa order
+heat_df <- corr_results %>%
+  filter(Taxon %in% top_taxa, Gene %in% target_vars) %>%
+  mutate(Taxon = factor(Taxon, levels = taxa_order),
+         Gene  = factor(Gene, levels = target_vars),
+         sig   = case_when(p < 0.001 ~ "***",
+                           p < 0.01  ~ "**",
+                           p < 0.05  ~ "*",
+                           TRUE      ~ ""),
+         label = sig)
+
+# ============================================================================
+# 6. LEfSe (KW + LDA score)
+# ============================================================================
+genus_meta <- genus_df %>%
+  rownames_to_column("SampleID") %>%
+  left_join(meta_raw %>% select(SampleID, Treatment1), by = "SampleID") %>%
+  mutate(Treatment1 = gsub("^\\d+_", "", Treatment1))
+
+TRT1_ORDER <- c("Control+Water","Control+SMT","Strep+Water","Strep+SMT")
+
+BLUE <- "#1C66C0"
+RED  <- "#C0392B"
+
+trt_colors <- c(
+  "Control+Water" = BLUE,
+  "Control+SMT"   = BLUE,
+  "Strep+Water"   = RED,
+  "Strep+SMT"     = RED
+)
+
+# Ensure Treatment1 labels are clean before LEfSe
+genus_meta <- genus_meta %>%
+  mutate(Treatment1 = trimws(as.character(Treatment1)))
+
+lefse_results <- lapply(taxa_order, function(taxon) {
+  groups  <- split(genus_meta[[taxon]], genus_meta$Treatment1)
+  groups  <- groups[intersect(TRT1_ORDER, names(groups))]
+  kw_test <- kruskal.test(genus_meta[[taxon]] ~ factor(genus_meta$Treatment1))
+  means    <- sapply(groups, function(g) mean(g, na.rm = TRUE))
+  means    <- means[!is.na(means)]
+  dominant <- trimws(as.character(names(which.max(means))))
+  if (length(dominant) == 0 || !dominant %in% TRT1_ORDER) {
+    # fallback: pick treatment with highest mean
+    dominant <- TRT1_ORDER[which.max(sapply(TRT1_ORDER, function(t)
+      mean(genus_meta[[taxon]][genus_meta$Treatment1 == t], na.rm = TRUE)))]
+  }
+
+  # LDA score: log10 of scaled between-group variance proxy
+  X  <- log10(genus_meta[[taxon]] * 1e6 + 1)
+  y  <- factor(genus_meta$Treatment1, levels = TRT1_ORDER)
+  gm <- tapply(X, y, mean)
+  om <- mean(X)
+  lda_score <- log10(sum(sapply(TRT1_ORDER, function(t)
+    sum(y == t) * (gm[t] - om)^2)) / length(X) + 1)
+
+  data.frame(Taxon    = taxon,
+             p_kw     = kw_test$p.value,
+             dominant = dominant,
+             lda_score = lda_score,
+             stringsAsFactors = FALSE)
+}) %>% bind_rows() %>%
+  mutate(Taxon = factor(Taxon, levels = taxa_order),
+         sig   = case_when(p_kw < 0.001 ~ "***",
+                           p_kw < 0.01  ~ "**",
+                           p_kw < 0.05  ~ "*",
+                           TRUE         ~ ""))
+
+cat("\nLEfSe results:\n")
+print(lefse_results %>% arrange(desc(lda_score)) %>%
+        select(Taxon, p_kw, dominant, lda_score, sig))
+
+# ============================================================================
+# 7. DC THEME
+# ============================================================================
+dc_theme <- theme_classic(base_size = 27) +
+  theme(
+    panel.border  = element_rect(colour = "black", fill = NA, linewidth = 1.0),
+    axis.text     = element_text(size = 26, color = "black"),
+    axis.title    = element_text(size = 29, color = "black", face = "bold"),
+    legend.title  = element_text(size = 23, face = "bold", color = "black"),
+    legend.text   = element_text(size = 22, color = "black"),
+    plot.title    = element_text(size = 26, face = "bold", color = "black"),
+    text          = element_text(color = "black")
+  )
+
+# ============================================================================
+# 8. HEATMAP
+# ============================================================================
+fig_heat <- ggplot(heat_df, aes(x = Gene, y = Taxon, fill = r)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = label), size = 7.8,
+            colour = "black", fontface = "bold") +
+  geom_vline(xintercept = 3.5, colour = "black", linewidth = 0.8,
+             linetype = "dashed") +
+  scale_fill_distiller(palette = "RdBu", limits = c(-0.55, 0.55),
+                       name = "Spearman r\n(blue = +, red = −)") +
+  scale_x_discrete(position = "top") +
+  scale_y_discrete(limits = taxa_order, labels = taxa_labels) +
+  labs(title = "Correlation with plant immunity\n& disease severity",
+       x = NULL, y = NULL) +
+  dc_theme +
+  theme(axis.text.x     = element_text(size = 21, face = "bold",
+                                              angle = 0,  color = "black"),
+        axis.text.y     = element_text(size = 19, face = "italic",
+                                              color = "black"),
+        axis.ticks      = element_blank(),
+        panel.border    = element_blank(),
+        legend.position = "left") +
+  # Divider lines between treatment groups
+  geom_hline(
+    yintercept = cumsum(table(ordering_df$dominant_trt)[TRT1_ORDER_TMP]) + 0.5,
+    colour = "black", linewidth = 0.8, linetype = "dashed"
+  )
+
+# ============================================================================
+# 9. LDA BAR — key: use same discrete y-axis as heatmap so bars align exactly
+# ============================================================================
+# Add pattern and stroke colour to lefse_results
+lefse_results <- lefse_results %>%
+  mutate(
+    bar_pattern = case_when(
+      dominant %in% c("Control+SMT", "Strep+SMT") ~ "circle",
+      TRUE                                          ~ "none"
+    ),
+    bar_stroke = case_when(
+      dominant %in% c("Control+SMT", "Strep+SMT") ~ "#AAAAAA",
+      TRUE                                          ~ "black"
+    )
+  )
+
+fig_lda <- ggplot(lefse_results,
+                  aes(x = lda_score,
+                      y = factor(Taxon, levels = taxa_order),
+                      fill = dominant)) +
+  ggpattern::geom_col_pattern(
+    aes(pattern      = bar_pattern,
+        pattern_fill = dominant),
+    colour          = "black",
+    linewidth       = 0.5,
+    alpha           = 0.85,
+    width           = 1.0,
+    pattern_colour  = "white",
+    pattern_fill    = "white",
+    pattern_spacing = 0.055,
+    pattern_density = 0.4,
+    pattern_size    = 0.5
+  ) +
+  scale_pattern_identity() +
+  scale_pattern_fill_manual(values = trt_colors, guide = "none") +
+  geom_text(aes(x = lda_score + max(lefse_results$lda_score) * 0.05,
+                label = sig),
+            hjust = 0, size = 9.1, fontface = "bold", colour = "black") +
+  scale_fill_manual(
+    values   = trt_colors,
+    na.value = RED,
+    name     = "Treatment\nassociation",
+    labels   = c("Control+Water", "Control+SMT (SMT)",
+                 "Strep+Water",   "Strep+SMT (SMT)"),
+    drop     = FALSE
+  ) +
+  scale_y_discrete(limits = taxa_order, labels = taxa_labels) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.25)),
+                     breaks = c(0, 0.04, 0.08),
+                     labels = c("0", "0.04", "0.08"),
+                     limits = c(0, NA)) +
+  labs(title = "LEfSe\ntreatment association",
+       x = "LDA score (log\u2081\u2080)", y = NULL) +
+  dc_theme +
+  theme(axis.text.y     = element_blank(),
+        axis.ticks.y    = element_blank(),
+        axis.line.y     = element_blank(),
+        legend.position = "right") +
+  geom_hline(
+    yintercept = cumsum(table(ordering_df$dominant_trt)[TRT1_ORDER_TMP]) + 0.5,
+    colour = "black", linewidth = 0.8, linetype = "dashed"
+  ) +
+  guides(fill = guide_legend(
+    override.aes = list(
+      pattern       = c("none","circle","none","circle"),
+      pattern_fill  = c(BLUE, BLUE, RED, RED),
+      pattern_colour = "white",
+      colour        = "black"
+    )
+  ))
+
+# ============================================================================
+# 10. COMBINE & SAVE
+# ============================================================================
+combined <- fig_heat + fig_lda +
+  plot_layout(widths = c(1, 0.6)) +
+  plot_annotation(
+    theme = theme(
+      plot.title    = element_blank(),
+      plot.subtitle = element_blank()
+    )
+  )
+
+ggsave("figure_heatmap_lefse_text_test.pdf", combined, width = 13, height = 15, dpi = 1200)
+ggsave("figure_heatmap_lefse_text.png", combined, width = 13, height = 15, dpi = 1200)
+cat("\nSaved: figure_heatmap_lefse.pdf  and  figure_heatmap_lefse.png\n")
+
